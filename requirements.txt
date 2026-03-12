@@ -1,0 +1,5 @@
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+gspread==6.2.1
+google-auth==2.40.3
+requests==2.32.5
