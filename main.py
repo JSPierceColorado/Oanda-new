@@ -640,29 +640,42 @@ def combine_fitness(train_metrics: StrategyMetrics, val_metrics: StrategyMetrics
     train_trade_factor = min(1.0, train_metrics.trades / max(1, min_trades))
     val_trade_factor = min(1.0, val_metrics.trades / max(1, max(5, min_trades // 2)))
 
+    train_realized_rate = max(0.0, 100.0 - train_metrics.open_at_end_rate)
+    val_realized_rate = max(0.0, 100.0 - val_metrics.open_at_end_rate)
+
     train_score = (
         train_metrics.total_pnl_pct * 1.0
-        + train_metrics.win_rate * 0.60
-        + train_metrics.avg_pnl_pct * 45.0
+        + train_metrics.win_rate * 0.55
+        + train_metrics.avg_pnl_pct * 40.0
         + min(train_metrics.profit_factor, 5.0) * 4.0
-        + train_metrics.tp_rate * 0.35
-        + train_metrics.armed_rate * 0.12
-        - train_metrics.stop_rate * 0.75
+        + train_metrics.tp_rate * 0.45
+        + train_realized_rate * 0.30
+        + train_metrics.armed_rate * 0.10
+        - train_metrics.stop_rate * 0.80
+        - train_metrics.open_at_end_rate * 0.70
     ) * train_trade_factor
 
     val_score = (
         val_metrics.total_pnl_pct * 1.2
-        + val_metrics.win_rate * 0.70
-        + val_metrics.avg_pnl_pct * 55.0
+        + val_metrics.win_rate * 0.65
+        + val_metrics.avg_pnl_pct * 48.0
         + min(val_metrics.profit_factor, 5.0) * 5.0
-        + val_metrics.tp_rate * 0.45
-        + val_metrics.armed_rate * 0.12
-        - val_metrics.stop_rate * 0.90
+        + val_metrics.tp_rate * 0.60
+        + val_realized_rate * 0.45
+        + val_metrics.armed_rate * 0.10
+        - val_metrics.stop_rate * 0.95
+        - val_metrics.open_at_end_rate * 1.10
     ) * val_trade_factor
 
     shortage_penalty = max(0, min_trades - train_metrics.trades) * 2.0
     negative_val_penalty = abs(min(0.0, val_metrics.total_pnl_pct)) * 6.0
-    return train_score * 0.55 + val_score * 0.45 - shortage_penalty - negative_val_penalty
+    all_open_penalty = 0.0
+    if train_metrics.trades > 0 and train_metrics.open_at_end_rate >= 99.9:
+        all_open_penalty += 60.0
+    if val_metrics.trades > 0 and val_metrics.open_at_end_rate >= 99.9:
+        all_open_penalty += 90.0
+
+    return train_score * 0.50 + val_score * 0.50 - shortage_penalty - negative_val_penalty - all_open_penalty
 
 
 def random_genome(cfg: Config) -> StrategyGenome:
