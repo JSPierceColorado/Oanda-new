@@ -1,4 +1,3 @@
-
 import base64
 import json
 import logging
@@ -85,16 +84,58 @@ def clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def chunked(items: List[str], n: int) -> List[List[str]]:
-    return [items[i:i + n] for i in range(0, len(items), n)]
-
-
 def col_to_a1(n: int) -> str:
     s = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
+
+
+def _safe_log10(x: float) -> float:
+    return math.log10(max(x, 1e-9))
+
+
+def sample_wide_range(min_value: float, max_value: float, anchor_value: float, tail_prob: float = 0.15) -> float:
+    min_value = max(1e-9, float(min_value))
+    max_value = max(min_value, float(max_value))
+    anchor_value = clip(float(anchor_value), min_value, max_value)
+
+    # Preserve some true full-range exploration.
+    if random.random() < tail_prob:
+        return random.uniform(min_value, max_value)
+
+    # When the range is very wide, explore in log space so extremes do not dominate.
+    ratio = max_value / min_value if min_value > 0 else 1.0
+    if ratio >= 20.0:
+        lo = _safe_log10(min_value)
+        hi = _safe_log10(max_value)
+        mid = _safe_log10(anchor_value)
+        return 10 ** random.triangular(lo, hi, mid)
+
+    return random.triangular(min_value, max_value, anchor_value)
+
+
+def mutate_wide_param(current: float, min_value: float, max_value: float, strength: float, anchor_value: float) -> float:
+    min_value = max(1e-9, float(min_value))
+    max_value = max(min_value, float(max_value))
+    current = clip(float(current), min_value, max_value)
+    anchor_value = clip(float(anchor_value), min_value, max_value)
+
+    # Occasionally do a fresh jump anywhere in the full range.
+    if random.random() < 0.18:
+        return sample_wide_range(min_value, max_value, anchor_value)
+
+    ratio = max_value / min_value if min_value > 0 else 1.0
+    if ratio >= 20.0:
+        lo = _safe_log10(min_value)
+        hi = _safe_log10(max_value)
+        cur = _safe_log10(current)
+        step = max(0.05, strength * 0.35)
+        return 10 ** clip(cur + random.gauss(0.0, step), lo, hi)
+
+    step = max((max_value - min_value) * 0.01, strength * (max_value - min_value) * 0.12)
+    return clip(current + random.gauss(0.0, step), min_value, max_value)
 
 
 # ----------------------------
@@ -136,15 +177,24 @@ class Config:
     signal_poll_seconds: int = 60
     retrain_minutes: int = 60
 
-    population_size: int = 80
-    generations: int = 30
+    population_size: int = 125
+    generations: int = 40
     elite_count: int = 10
+    immigrant_fraction: float = 0.20
+    leaderboard_size: int = 100
     mutation_rate: float = 0.18
     mutation_strength: float = 0.45
-    hold_min_steps: int = 1
-    hold_max_steps: int = 8
+
     threshold_min: float = 20.0
     threshold_max: float = 75.0
+
+    arm_pct_min: float = 0.15
+    arm_pct_max: float = 0.80
+    trail_drop_pct_min: float = 0.05
+    trail_drop_pct_max: float = 0.40
+    stop_loss_pct_min: float = 0.05
+    stop_loss_pct_max: float = 0.40
+
     min_trades: int = 15
     validation_split: float = 0.25
     random_seed: int = 42
@@ -155,6 +205,14 @@ class Config:
     def __post_init__(self) -> None:
         if self.elite_count >= self.population_size:
             self.elite_count = max(1, self.population_size // 4)
+        self.arm_pct_min = max(0.01, self.arm_pct_min)
+        self.arm_pct_max = max(self.arm_pct_min, self.arm_pct_max)
+        self.trail_drop_pct_min = max(0.01, self.trail_drop_pct_min)
+        self.trail_drop_pct_max = max(self.trail_drop_pct_min, self.trail_drop_pct_max)
+        self.stop_loss_pct_min = max(0.01, self.stop_loss_pct_min)
+        self.stop_loss_pct_max = max(self.stop_loss_pct_min, self.stop_loss_pct_max)
+        self.immigrant_fraction = clip(self.immigrant_fraction, 0.0, 0.80)
+        self.leaderboard_size = max(10, self.leaderboard_size)
 
 
 def load_config() -> Config:
@@ -167,15 +225,21 @@ def load_config() -> Config:
         best_strategy_tab=os.getenv("BEST_STRATEGY_TAB", "BestStrategy"),
         signal_poll_seconds=env_int("SIGNAL_POLL_SECONDS", 60),
         retrain_minutes=env_int("RETRAIN_MINUTES", 60),
-        population_size=env_int("POPULATION_SIZE", 80),
-        generations=env_int("GENERATIONS", 30),
+        population_size=env_int("POPULATION_SIZE", 125),
+        generations=env_int("GENERATIONS", 40),
         elite_count=env_int("ELITE_COUNT", 10),
+        immigrant_fraction=env_float("IMMIGRANT_FRACTION", 0.20),
+        leaderboard_size=env_int("LEADERBOARD_SIZE", 100),
         mutation_rate=env_float("MUTATION_RATE", 0.18),
         mutation_strength=env_float("MUTATION_STRENGTH", 0.45),
-        hold_min_steps=env_int("HOLD_MIN_STEPS", 1),
-        hold_max_steps=env_int("HOLD_MAX_STEPS", 8),
         threshold_min=env_float("THRESHOLD_MIN", 20.0),
         threshold_max=env_float("THRESHOLD_MAX", 75.0),
+        arm_pct_min=env_float("ARM_PCT_MIN", 0.15),
+        arm_pct_max=env_float("ARM_PCT_MAX", 0.80),
+        trail_drop_pct_min=env_float("TRAIL_DROP_PCT_MIN", 0.05),
+        trail_drop_pct_max=env_float("TRAIL_DROP_PCT_MAX", 0.40),
+        stop_loss_pct_min=env_float("STOP_LOSS_PCT_MIN", 0.05),
+        stop_loss_pct_max=env_float("STOP_LOSS_PCT_MAX", 0.40),
         min_trades=env_int("MIN_TRADES", 15),
         validation_split=env_float("VALIDATION_SPLIT", 0.25),
         state_file=os.getenv("STATE_FILE", "/tmp/best_strategy.json"),
@@ -245,7 +309,7 @@ class Sample:
     symbol: str
     asof_utc: str
     features: Dict[str, float]
-    future_returns: Dict[int, float]
+    future_prices: List[float]
     spread_cost_pct: float
     current_price: float
 
@@ -256,7 +320,9 @@ class StrategyGenome:
     weights: Dict[str, float]
     bias: float
     threshold: float
-    hold_steps: int
+    arm_pct: float = 0.30
+    trail_drop_pct: float = 0.15
+    stop_loss_pct: float = 0.15
 
 
 @dataclass
@@ -267,12 +333,25 @@ class StrategyMetrics:
     win_rate: float = 0.0
     total_pnl_pct: float = 0.0
     avg_pnl_pct: float = 0.0
+    avg_win_pct: float = 0.0
+    avg_loss_pct: float = 0.0
     profit_factor: float = 0.0
     long_trades: int = 0
     short_trades: int = 0
+    tp_exits: int = 0
+    stop_exits: int = 0
+    open_at_end_exits: int = 0
+    armed_trades: int = 0
+    tp_rate: float = 0.0
+    stop_rate: float = 0.0
+    open_at_end_rate: float = 0.0
+    armed_rate: float = 0.0
     validation_trades: int = 0
     validation_win_rate: float = 0.0
     validation_pnl_pct: float = 0.0
+    validation_tp_rate: float = 0.0
+    validation_stop_rate: float = 0.0
+    validation_open_at_end_rate: float = 0.0
     fitness: float = -1e9
 
 
@@ -290,6 +369,15 @@ class BestStrategyBundle:
     feature_stats: Dict[str, FeatureStats]
     trained_at: str
     leaderboard: List[LeaderboardEntry] = field(default_factory=list)
+
+
+@dataclass
+class ExitResult:
+    pnl_pct: float
+    peak_pnl_pct: float
+    armed: bool
+    reason: str
+    bars_held: int
 
 
 # ----------------------------
@@ -384,7 +472,7 @@ def normalize_features(row: Dict[str, str], feature_stats: Dict[str, FeatureStat
     return normalized
 
 
-def build_samples(blocks: List[List[Dict[str, str]]], feature_stats: Dict[str, FeatureStats], hold_max_steps: int) -> List[Sample]:
+def build_samples(blocks: List[List[Dict[str, str]]], feature_stats: Dict[str, FeatureStats]) -> List[Sample]:
     series: Dict[str, List[Dict[str, str]]] = {}
     for block in blocks:
         for row in block:
@@ -399,22 +487,22 @@ def build_samples(blocks: List[List[Dict[str, str]]], feature_stats: Dict[str, F
 
     samples: List[Sample] = []
     for symbol, rows in series.items():
-        if len(rows) <= hold_max_steps:
+        if len(rows) <= 2:
             continue
-        for i in range(len(rows) - hold_max_steps):
+        for i in range(len(rows) - 1):
             current = rows[i]
             entry_price = pick_price(current)
             if entry_price is None or entry_price <= 0:
                 continue
 
-            future_returns: Dict[int, float] = {}
-            for hold in range(1, hold_max_steps + 1):
-                future_price = pick_price(rows[i + hold])
+            future_prices: List[float] = []
+            for future_row in rows[i + 1 :]:
+                future_price = pick_price(future_row)
                 if future_price is None or future_price <= 0:
                     continue
-                future_returns[hold] = ((future_price / entry_price) - 1.0) * 100.0
+                future_prices.append(future_price)
 
-            if not future_returns:
+            if not future_prices:
                 continue
 
             spread_pct = safe_float(current.get("spread_pct"), 0.0) or 0.0
@@ -424,7 +512,7 @@ def build_samples(blocks: List[List[Dict[str, str]]], feature_stats: Dict[str, F
                     symbol=symbol,
                     asof_utc=str(current.get("asof_utc", "")),
                     features=normalize_features(current, feature_stats),
-                    future_returns=future_returns,
+                    future_prices=future_prices,
                     spread_cost_pct=spread_cost_pct,
                     current_price=entry_price,
                 )
@@ -446,16 +534,57 @@ def score_strategy(genome: StrategyGenome, features: Dict[str, float]) -> float:
     return clip(math.tanh(raw) * 100.0, -100.0, 100.0)
 
 
+def simulate_exit(sample: Sample, genome: StrategyGenome, direction: float) -> ExitResult:
+    peak_pnl = -1e9
+    armed = False
+    last_pnl = 0.0
+
+    for step, future_price in enumerate(sample.future_prices, start=1):
+        pnl_pct = direction * (((future_price / sample.current_price) - 1.0) * 100.0)
+        last_pnl = pnl_pct
+        peak_pnl = max(peak_pnl, pnl_pct)
+
+        if peak_pnl >= genome.arm_pct:
+            armed = True
+
+        # Conservative ordering on snapshot data: if a sampled price is already through stop,
+        # treat it as a stop-loss exit.
+        if pnl_pct <= -genome.stop_loss_pct:
+            return ExitResult(
+                pnl_pct=pnl_pct,
+                peak_pnl_pct=max(peak_pnl, pnl_pct),
+                armed=armed,
+                reason="STOP_LOSS",
+                bars_held=step,
+            )
+
+        if armed and (peak_pnl - pnl_pct) >= genome.trail_drop_pct:
+            return ExitResult(
+                pnl_pct=pnl_pct,
+                peak_pnl_pct=peak_pnl,
+                armed=armed,
+                reason="TRAIL_TP",
+                bars_held=step,
+            )
+
+    if peak_pnl == -1e9:
+        peak_pnl = last_pnl
+
+    return ExitResult(
+        pnl_pct=last_pnl,
+        peak_pnl_pct=peak_pnl,
+        armed=armed,
+        reason="OPEN_AT_END",
+        bars_held=len(sample.future_prices),
+    )
+
+
 def simulate(genome: StrategyGenome, samples: Iterable[Sample]) -> StrategyMetrics:
     metrics = StrategyMetrics()
     gross_profit = 0.0
     gross_loss = 0.0
 
     for sample in samples:
-        forward = sample.future_returns.get(genome.hold_steps)
-        if forward is None:
-            continue
-
         score = score_strategy(genome, sample.features)
         if abs(score) < genome.threshold:
             continue
@@ -467,8 +596,19 @@ def simulate(genome: StrategyGenome, samples: Iterable[Sample]) -> StrategyMetri
         else:
             metrics.short_trades += 1
 
-        pnl_pct = direction * forward - sample.spread_cost_pct
+        exit_result = simulate_exit(sample, genome, direction)
+        pnl_pct = exit_result.pnl_pct - sample.spread_cost_pct
         metrics.total_pnl_pct += pnl_pct
+
+        if exit_result.armed:
+            metrics.armed_trades += 1
+
+        if exit_result.reason == "TRAIL_TP" and pnl_pct > 0:
+            metrics.tp_exits += 1
+        elif exit_result.reason == "STOP_LOSS":
+            metrics.stop_exits += 1
+        else:
+            metrics.open_at_end_exits += 1
 
         if pnl_pct > 0:
             metrics.wins += 1
@@ -480,6 +620,14 @@ def simulate(genome: StrategyGenome, samples: Iterable[Sample]) -> StrategyMetri
     if metrics.trades > 0:
         metrics.win_rate = metrics.wins / metrics.trades * 100.0
         metrics.avg_pnl_pct = metrics.total_pnl_pct / metrics.trades
+        metrics.tp_rate = metrics.tp_exits / metrics.trades * 100.0
+        metrics.stop_rate = metrics.stop_exits / metrics.trades * 100.0
+        metrics.open_at_end_rate = metrics.open_at_end_exits / metrics.trades * 100.0
+        metrics.armed_rate = metrics.armed_trades / metrics.trades * 100.0
+    if metrics.wins > 0:
+        metrics.avg_win_pct = gross_profit / metrics.wins
+    if metrics.losses > 0:
+        metrics.avg_loss_pct = gross_loss / metrics.losses
     if gross_loss > 0:
         metrics.profit_factor = gross_profit / gross_loss
     elif gross_profit > 0:
@@ -489,25 +637,32 @@ def simulate(genome: StrategyGenome, samples: Iterable[Sample]) -> StrategyMetri
 
 
 def combine_fitness(train_metrics: StrategyMetrics, val_metrics: StrategyMetrics, min_trades: int) -> float:
-    trade_factor = min(1.0, train_metrics.trades / max(1, min_trades))
+    train_trade_factor = min(1.0, train_metrics.trades / max(1, min_trades))
     val_trade_factor = min(1.0, val_metrics.trades / max(1, max(5, min_trades // 2)))
 
     train_score = (
-        train_metrics.total_pnl_pct
-        + train_metrics.win_rate * 0.45
-        + train_metrics.avg_pnl_pct * 25.0
-        + min(train_metrics.profit_factor, 5.0) * 2.0
-    ) * trade_factor
+        train_metrics.total_pnl_pct * 1.0
+        + train_metrics.win_rate * 0.60
+        + train_metrics.avg_pnl_pct * 45.0
+        + min(train_metrics.profit_factor, 5.0) * 4.0
+        + train_metrics.tp_rate * 0.35
+        + train_metrics.armed_rate * 0.12
+        - train_metrics.stop_rate * 0.75
+    ) * train_trade_factor
 
     val_score = (
-        val_metrics.total_pnl_pct
-        + val_metrics.win_rate * 0.55
-        + val_metrics.avg_pnl_pct * 30.0
-        + min(val_metrics.profit_factor, 5.0) * 2.0
+        val_metrics.total_pnl_pct * 1.2
+        + val_metrics.win_rate * 0.70
+        + val_metrics.avg_pnl_pct * 55.0
+        + min(val_metrics.profit_factor, 5.0) * 5.0
+        + val_metrics.tp_rate * 0.45
+        + val_metrics.armed_rate * 0.12
+        - val_metrics.stop_rate * 0.90
     ) * val_trade_factor
 
     shortage_penalty = max(0, min_trades - train_metrics.trades) * 2.0
-    return train_score * 0.65 + val_score * 0.35 - shortage_penalty
+    negative_val_penalty = abs(min(0.0, val_metrics.total_pnl_pct)) * 6.0
+    return train_score * 0.55 + val_score * 0.45 - shortage_penalty - negative_val_penalty
 
 
 def random_genome(cfg: Config) -> StrategyGenome:
@@ -515,8 +670,10 @@ def random_genome(cfg: Config) -> StrategyGenome:
         strategy_id=str(uuid.uuid4())[:8],
         weights={feature: random.uniform(-2.0, 2.0) for feature in FEATURE_COLUMNS},
         bias=random.uniform(-1.5, 1.5),
-        threshold=random.uniform(cfg.threshold_min, cfg.threshold_max),
-        hold_steps=random.randint(cfg.hold_min_steps, cfg.hold_max_steps),
+        threshold=sample_wide_range(cfg.threshold_min, cfg.threshold_max, 50.0, tail_prob=0.12),
+        arm_pct=sample_wide_range(cfg.arm_pct_min, cfg.arm_pct_max, 0.30, tail_prob=0.15),
+        trail_drop_pct=sample_wide_range(cfg.trail_drop_pct_min, cfg.trail_drop_pct_max, 0.15, tail_prob=0.15),
+        stop_loss_pct=sample_wide_range(cfg.stop_loss_pct_min, cfg.stop_loss_pct_max, 0.15, tail_prob=0.15),
     )
 
 
@@ -535,7 +692,17 @@ def crossover(a: StrategyGenome, b: StrategyGenome, cfg: Config) -> StrategyGeno
         weights=child_weights,
         bias=(a.bias + b.bias) / 2.0 if random.random() < 0.5 else random.choice([a.bias, b.bias]),
         threshold=random.choice([a.threshold, b.threshold, (a.threshold + b.threshold) / 2.0]),
-        hold_steps=random.choice([a.hold_steps, b.hold_steps]),
+        arm_pct=random.choice([a.arm_pct, b.arm_pct, (a.arm_pct + b.arm_pct) / 2.0]),
+        trail_drop_pct=random.choice([
+            a.trail_drop_pct,
+            b.trail_drop_pct,
+            (a.trail_drop_pct + b.trail_drop_pct) / 2.0,
+        ]),
+        stop_loss_pct=random.choice([
+            a.stop_loss_pct,
+            b.stop_loss_pct,
+            (a.stop_loss_pct + b.stop_loss_pct) / 2.0,
+        ]),
     )
 
 
@@ -545,7 +712,9 @@ def mutate(genome: StrategyGenome, cfg: Config) -> StrategyGenome:
         weights=dict(genome.weights),
         bias=genome.bias,
         threshold=genome.threshold,
-        hold_steps=genome.hold_steps,
+        arm_pct=genome.arm_pct,
+        trail_drop_pct=genome.trail_drop_pct,
+        stop_loss_pct=genome.stop_loss_pct,
     )
 
     for feature in FEATURE_COLUMNS:
@@ -557,19 +726,40 @@ def mutate(genome: StrategyGenome, cfg: Config) -> StrategyGenome:
         child.bias = clip(child.bias + random.gauss(0.0, cfg.mutation_strength), -4.0, 4.0)
 
     if random.random() < cfg.mutation_rate:
-        child.threshold = clip(
-            child.threshold + random.gauss(0.0, cfg.mutation_strength * 15.0),
+        child.threshold = mutate_wide_param(
+            child.threshold,
             cfg.threshold_min,
             cfg.threshold_max,
+            cfg.mutation_strength,
+            50.0,
         )
 
     if random.random() < cfg.mutation_rate:
-        child.hold_steps = clip(
-            child.hold_steps + random.choice([-2, -1, 1, 2]),
-            cfg.hold_min_steps,
-            cfg.hold_max_steps,
+        child.arm_pct = mutate_wide_param(
+            child.arm_pct,
+            cfg.arm_pct_min,
+            cfg.arm_pct_max,
+            cfg.mutation_strength,
+            0.30,
         )
-        child.hold_steps = int(child.hold_steps)
+
+    if random.random() < cfg.mutation_rate:
+        child.trail_drop_pct = mutate_wide_param(
+            child.trail_drop_pct,
+            cfg.trail_drop_pct_min,
+            cfg.trail_drop_pct_max,
+            cfg.mutation_strength,
+            0.15,
+        )
+
+    if random.random() < cfg.mutation_rate:
+        child.stop_loss_pct = mutate_wide_param(
+            child.stop_loss_pct,
+            cfg.stop_loss_pct_min,
+            cfg.stop_loss_pct_max,
+            cfg.mutation_strength,
+            0.15,
+        )
 
     return child
 
@@ -581,7 +771,7 @@ def tournament_select(scored: List[Tuple[StrategyGenome, StrategyMetrics]], k: i
 
 
 def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureStats], cfg: Config, log: logging.Logger) -> BestStrategyBundle:
-    if len(samples) < max(20, cfg.min_trades + cfg.hold_max_steps):
+    if len(samples) < max(20, cfg.min_trades + 5):
         raise RuntimeError("Not enough history to evolve strategies yet.")
 
     split_idx = max(1, int(len(samples) * (1.0 - cfg.validation_split)))
@@ -590,6 +780,7 @@ def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureSta
 
     population = [random_genome(cfg) for _ in range(cfg.population_size)]
     top_scored: List[Tuple[StrategyGenome, StrategyMetrics]] = []
+    immigrant_count = max(1, int(round(cfg.population_size * cfg.immigrant_fraction))) if cfg.population_size > 2 else 0
 
     for generation in range(1, cfg.generations + 1):
         scored: List[Tuple[StrategyGenome, StrategyMetrics]] = []
@@ -599,37 +790,50 @@ def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureSta
             train_metrics.validation_trades = val_metrics.trades
             train_metrics.validation_win_rate = val_metrics.win_rate
             train_metrics.validation_pnl_pct = val_metrics.total_pnl_pct
+            train_metrics.validation_tp_rate = val_metrics.tp_rate
+            train_metrics.validation_stop_rate = val_metrics.stop_rate
+            train_metrics.validation_open_at_end_rate = val_metrics.open_at_end_rate
             train_metrics.fitness = combine_fitness(train_metrics, val_metrics, cfg.min_trades)
             scored.append((genome, train_metrics))
 
         scored.sort(key=lambda item: item[1].fitness, reverse=True)
         best_genome, best_metrics = scored[0]
         log.info(
-            "generation=%d best_fitness=%.2f trades=%d win_rate=%.1f total_pnl=%.2f hold=%d threshold=%.1f",
+            "generation=%d best_fitness=%.2f trades=%d win_rate=%.1f total_pnl=%.3f threshold=%.1f arm=%.3f trail=%.3f stop=%.3f open_end_rate=%.1f",
             generation,
             best_metrics.fitness,
             best_metrics.trades,
             best_metrics.win_rate,
             best_metrics.total_pnl_pct,
-            best_genome.hold_steps,
             best_genome.threshold,
+            best_genome.arm_pct,
+            best_genome.trail_drop_pct,
+            best_genome.stop_loss_pct,
+            best_metrics.open_at_end_rate,
         )
-        top_scored = scored[: max(10, cfg.elite_count)]
+        top_scored = scored[: max(cfg.leaderboard_size, cfg.elite_count)]
 
-        next_population: List[StrategyGenome] = [g for g, _ in scored[: cfg.elite_count]]
-        while len(next_population) < cfg.population_size:
+        elites = [g for g, _ in scored[: cfg.elite_count]]
+        next_population: List[StrategyGenome] = list(elites)
+        breed_target = max(cfg.elite_count, cfg.population_size - immigrant_count)
+
+        while len(next_population) < breed_target:
             parent_a = tournament_select(scored)
             parent_b = tournament_select(scored)
             child = crossover(parent_a, parent_b, cfg)
             child = mutate(child, cfg)
             next_population.append(child)
+
+        while len(next_population) < cfg.population_size:
+            next_population.append(random_genome(cfg))
+
         population = next_population
 
     top_scored.sort(key=lambda item: item[1].fitness, reverse=True)
     best_genome, best_metrics = top_scored[0]
 
     leaderboard: List[LeaderboardEntry] = []
-    for rank, (genome, metrics) in enumerate(top_scored[:10], start=1):
+    for rank, (genome, metrics) in enumerate(top_scored[: cfg.leaderboard_size], start=1):
         leaderboard.append(LeaderboardEntry(rank=rank, genome=genome, metrics=metrics))
 
     bundle = BestStrategyBundle(
@@ -665,25 +869,51 @@ def save_bundle(bundle: BestStrategyBundle, path: str) -> None:
     Path(path).write_text(json.dumps(serializable, indent=2), encoding="utf-8")
 
 
+def _genome_from_dict(data: Dict[str, Any]) -> StrategyGenome:
+    clean = dict(data)
+    clean.pop("hold_steps", None)
+    return StrategyGenome(
+        strategy_id=str(clean.get("strategy_id") or str(uuid.uuid4())[:8]),
+        weights=dict(clean.get("weights") or {}),
+        bias=float(clean.get("bias", 0.0)),
+        threshold=float(clean.get("threshold", 50.0)),
+        arm_pct=float(clean.get("arm_pct", 0.30)),
+        trail_drop_pct=float(clean.get("trail_drop_pct", 0.15)),
+        stop_loss_pct=float(clean.get("stop_loss_pct", 0.15)),
+    )
+
+
+def _metrics_from_dict(data: Dict[str, Any]) -> StrategyMetrics:
+    clean = dict(data)
+    if "timeout_exits" in clean and "open_at_end_exits" not in clean:
+        clean["open_at_end_exits"] = clean.pop("timeout_exits")
+    else:
+        clean.pop("timeout_exits", None)
+    return StrategyMetrics(**clean)
+
+
 def load_bundle(path: str) -> Optional[BestStrategyBundle]:
     p = Path(path)
     if not p.exists():
         return None
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return BestStrategyBundle(
-        genome=StrategyGenome(**data["genome"]),
-        metrics=StrategyMetrics(**data["metrics"]),
-        feature_stats={k: FeatureStats(**v) for k, v in data["feature_stats"].items()},
-        trained_at=data["trained_at"],
-        leaderboard=[
-            LeaderboardEntry(
-                rank=entry["rank"],
-                genome=StrategyGenome(**entry["genome"]),
-                metrics=StrategyMetrics(**entry["metrics"]),
-            )
-            for entry in data.get("leaderboard", [])
-        ],
-    )
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return BestStrategyBundle(
+            genome=_genome_from_dict(data["genome"]),
+            metrics=_metrics_from_dict(data["metrics"]),
+            feature_stats={k: FeatureStats(**v) for k, v in data["feature_stats"].items()},
+            trained_at=data["trained_at"],
+            leaderboard=[
+                LeaderboardEntry(
+                    rank=entry["rank"],
+                    genome=_genome_from_dict(entry["genome"]),
+                    metrics=_metrics_from_dict(entry["metrics"]),
+                )
+                for entry in data.get("leaderboard", [])
+            ],
+        )
+    except Exception:
+        return None
 
 
 # ----------------------------
@@ -722,7 +952,9 @@ def build_signal_rows(bundle: BestStrategyBundle, screener_rows: List[Dict[str, 
             side,
             entry_signal,
             round(bundle.genome.threshold, 2),
-            bundle.genome.hold_steps,
+            round(bundle.genome.arm_pct, 4),
+            round(bundle.genome.trail_drop_pct, 4),
+            round(bundle.genome.stop_loss_pct, 4),
             row.get("last_trade_price", ""),
             row.get("bid", ""),
             row.get("ask", ""),
@@ -751,7 +983,9 @@ SIGNAL_HEADERS = [
     "side",
     "entry_signal",
     "threshold",
-    "hold_steps",
+    "arm_pct",
+    "trail_drop_pct",
+    "stop_loss_pct",
     "last_trade_price",
     "bid",
     "ask",
@@ -796,12 +1030,12 @@ class StrategyService:
         if not headers:
             raise RuntimeError("Missing screener headers")
         feature_stats = compute_feature_stats(history_blocks)
-        samples = build_samples(history_blocks, feature_stats, self.cfg.hold_max_steps)
+        samples = build_samples(history_blocks, feature_stats)
         bundle = evolve_strategies(samples, feature_stats, self.cfg, self.log)
         save_bundle(bundle, self.cfg.state_file)
 
         ss = self._sheet()
-        leaderboard_ws = get_or_create_ws(ss, self.cfg.leaderboard_tab, rows=1000, cols=30)
+        leaderboard_ws = get_or_create_ws(ss, self.cfg.leaderboard_tab, rows=max(1000, self.cfg.leaderboard_size + 10), cols=40)
         best_ws = get_or_create_ws(ss, self.cfg.best_strategy_tab, rows=200, cols=10)
 
         leaderboard_headers = [
@@ -813,11 +1047,23 @@ class StrategyService:
             "total_pnl_pct",
             "avg_pnl_pct",
             "profit_factor",
+            "tp_exits",
+            "tp_rate",
+            "stop_exits",
+            "stop_rate",
+            "open_at_end_exits",
+            "open_at_end_rate",
+            "armed_rate",
             "validation_trades",
             "validation_win_rate",
             "validation_pnl_pct",
-            "hold_steps",
+            "validation_tp_rate",
+            "validation_stop_rate",
+            "validation_open_at_end_rate",
             "threshold",
+            "arm_pct",
+            "trail_drop_pct",
+            "stop_loss_pct",
             "trained_at",
             "weights_json",
         ]
@@ -833,11 +1079,23 @@ class StrategyService:
                 round(entry.metrics.total_pnl_pct, 4),
                 round(entry.metrics.avg_pnl_pct, 4),
                 round(entry.metrics.profit_factor, 4),
+                entry.metrics.tp_exits,
+                round(entry.metrics.tp_rate, 2),
+                entry.metrics.stop_exits,
+                round(entry.metrics.stop_rate, 2),
+                entry.metrics.open_at_end_exits,
+                round(entry.metrics.open_at_end_rate, 2),
+                round(entry.metrics.armed_rate, 2),
                 entry.metrics.validation_trades,
                 round(entry.metrics.validation_win_rate, 2),
                 round(entry.metrics.validation_pnl_pct, 4),
-                entry.genome.hold_steps,
+                round(entry.metrics.validation_tp_rate, 2),
+                round(entry.metrics.validation_stop_rate, 2),
+                round(entry.metrics.validation_open_at_end_rate, 2),
                 round(entry.genome.threshold, 2),
+                round(entry.genome.arm_pct, 4),
+                round(entry.genome.trail_drop_pct, 4),
+                round(entry.genome.stop_loss_pct, 4),
                 bundle.trained_at,
                 json.dumps(entry.genome.weights, separators=(",", ":")),
             ])
@@ -852,11 +1110,23 @@ class StrategyService:
             ("total_pnl_pct", round(bundle.metrics.total_pnl_pct, 4)),
             ("avg_pnl_pct", round(bundle.metrics.avg_pnl_pct, 4)),
             ("profit_factor", round(bundle.metrics.profit_factor, 4)),
+            ("tp_exits", bundle.metrics.tp_exits),
+            ("tp_rate", round(bundle.metrics.tp_rate, 2)),
+            ("stop_exits", bundle.metrics.stop_exits),
+            ("stop_rate", round(bundle.metrics.stop_rate, 2)),
+            ("open_at_end_exits", bundle.metrics.open_at_end_exits),
+            ("open_at_end_rate", round(bundle.metrics.open_at_end_rate, 2)),
+            ("armed_rate", round(bundle.metrics.armed_rate, 2)),
             ("validation_trades", bundle.metrics.validation_trades),
             ("validation_win_rate", round(bundle.metrics.validation_win_rate, 2)),
             ("validation_pnl_pct", round(bundle.metrics.validation_pnl_pct, 4)),
-            ("hold_steps", bundle.genome.hold_steps),
+            ("validation_tp_rate", round(bundle.metrics.validation_tp_rate, 2)),
+            ("validation_stop_rate", round(bundle.metrics.validation_stop_rate, 2)),
+            ("validation_open_at_end_rate", round(bundle.metrics.validation_open_at_end_rate, 2)),
             ("threshold", round(bundle.genome.threshold, 2)),
+            ("arm_pct", round(bundle.genome.arm_pct, 4)),
+            ("trail_drop_pct", round(bundle.genome.trail_drop_pct, 4)),
+            ("stop_loss_pct", round(bundle.genome.stop_loss_pct, 4)),
             ("weights", bundle.genome.weights),
         ])
 
@@ -869,6 +1139,14 @@ class StrategyService:
                 "screener_rows": len(screener_rows),
                 "strategy_id": bundle.genome.strategy_id,
                 "fitness": bundle.metrics.fitness,
+                "threshold": bundle.genome.threshold,
+                "arm_pct": bundle.genome.arm_pct,
+                "trail_drop_pct": bundle.genome.trail_drop_pct,
+                "stop_loss_pct": bundle.genome.stop_loss_pct,
+                "leaderboard_size": self.cfg.leaderboard_size,
+                "immigrant_fraction": self.cfg.immigrant_fraction,
+                "immigrants_per_generation": max(1, int(round(self.cfg.population_size * self.cfg.immigrant_fraction))) if self.cfg.population_size > 2 else 0,
+                "strategies_tested_per_train": self.cfg.population_size * self.cfg.generations,
             }
 
         return {
@@ -878,6 +1156,9 @@ class StrategyService:
             "fitness": bundle.metrics.fitness,
             "trades": bundle.metrics.trades,
             "win_rate": bundle.metrics.win_rate,
+            "tp_rate": bundle.metrics.tp_rate,
+            "stop_rate": bundle.metrics.stop_rate,
+            "open_at_end_rate": bundle.metrics.open_at_end_rate,
             "total_pnl_pct": bundle.metrics.total_pnl_pct,
         }
 
@@ -903,6 +1184,9 @@ class StrategyService:
             "signals_written": len(rows),
             "last_signal_at": self.last_signal_at,
             "strategy_id": bundle.genome.strategy_id,
+            "arm_pct": bundle.genome.arm_pct,
+            "trail_drop_pct": bundle.genome.trail_drop_pct,
+            "stop_loss_pct": bundle.genome.stop_loss_pct,
         }
 
     def cycle_once(self) -> Dict[str, Any]:
@@ -990,7 +1274,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FX Strategy Generator",
-    version="1.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
