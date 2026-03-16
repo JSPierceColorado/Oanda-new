@@ -144,8 +144,8 @@ def clamp_exit_params(
     stop_loss_pct: float,
     cfg: "Config",
 ) -> Tuple[float, float, float]:
-    # To guarantee trail_drop_pct <= 0.5 * arm_pct while also respecting the
-    # configured trail minimum, arm_pct must be at least 2 * trail_drop_pct_min.
+    # Guarantee trail_drop_pct <= 0.5 * arm_pct while also respecting the
+    # configured trail minimum.
     arm_floor = max(cfg.arm_pct_min, cfg.trail_drop_pct_min * 2.0)
 
     if cfg.arm_pct_max < arm_floor:
@@ -239,7 +239,7 @@ class Config:
         self.stop_loss_pct_min = max(0.01, self.stop_loss_pct_min)
         self.stop_loss_pct_max = max(self.stop_loss_pct_min, self.stop_loss_pct_max)
 
-        # Enforce that every valid arm_pct can support at least the minimum trail_drop_pct
+        # Ensure every valid arm_pct can support at least the minimum trail_drop_pct
         self.arm_pct_min = max(self.arm_pct_min, self.trail_drop_pct_min * 2.0)
 
         if self.arm_pct_max < self.arm_pct_min:
@@ -681,37 +681,53 @@ def combine_fitness(train_metrics: StrategyMetrics, val_metrics: StrategyMetrics
 
     train_score = (
         train_metrics.total_pnl_pct * 1.0
-        + train_metrics.win_rate * 0.55
-        + train_metrics.avg_pnl_pct * 40.0
-        + min(train_metrics.profit_factor, 5.0) * 4.0
-        + train_metrics.tp_rate * 0.45
-        + train_realized_rate * 0.30
-        + train_metrics.armed_rate * 0.10
-        - train_metrics.stop_rate * 0.80
-        - train_metrics.open_at_end_rate * 0.70
+        + train_metrics.win_rate * 0.45
+        + train_metrics.avg_pnl_pct * 32.0
+        + min(train_metrics.profit_factor, 5.0) * 3.5
+        + train_metrics.tp_rate * 0.90
+        + train_realized_rate * 0.70
+        + train_metrics.armed_rate * 0.08
+        - train_metrics.stop_rate * 1.10
+        - train_metrics.open_at_end_rate * 1.80
     ) * train_trade_factor
 
     val_score = (
-        val_metrics.total_pnl_pct * 1.2
-        + val_metrics.win_rate * 0.65
-        + val_metrics.avg_pnl_pct * 48.0
-        + min(val_metrics.profit_factor, 5.0) * 5.0
-        + val_metrics.tp_rate * 0.60
-        + val_realized_rate * 0.45
-        + val_metrics.armed_rate * 0.10
-        - val_metrics.stop_rate * 0.95
-        - val_metrics.open_at_end_rate * 1.10
+        val_metrics.total_pnl_pct * 1.25
+        + val_metrics.win_rate * 0.55
+        + val_metrics.avg_pnl_pct * 40.0
+        + min(val_metrics.profit_factor, 5.0) * 4.5
+        + val_metrics.tp_rate * 1.20
+        + val_realized_rate * 1.00
+        + val_metrics.armed_rate * 0.08
+        - val_metrics.stop_rate * 1.50
+        - val_metrics.open_at_end_rate * 2.60
     ) * val_trade_factor
 
     shortage_penalty = max(0, min_trades - train_metrics.trades) * 2.0
-    negative_val_penalty = abs(min(0.0, val_metrics.total_pnl_pct)) * 6.0
-    all_open_penalty = 0.0
-    if train_metrics.trades > 0 and train_metrics.open_at_end_rate >= 99.9:
-        all_open_penalty += 60.0
-    if val_metrics.trades > 0 and val_metrics.open_at_end_rate >= 99.9:
-        all_open_penalty += 90.0
+    negative_val_penalty = abs(min(0.0, val_metrics.total_pnl_pct)) * 8.0
 
-    return train_score * 0.50 + val_score * 0.50 - shortage_penalty - negative_val_penalty - all_open_penalty
+    open_end_penalty = 0.0
+    if train_metrics.open_at_end_rate > 50.0:
+        open_end_penalty += (train_metrics.open_at_end_rate - 50.0) * 2.5
+    if val_metrics.open_at_end_rate > 40.0:
+        open_end_penalty += (val_metrics.open_at_end_rate - 40.0) * 4.0
+
+    if train_metrics.open_at_end_rate >= 80.0:
+        open_end_penalty += 150.0
+    if val_metrics.open_at_end_rate >= 70.0:
+        open_end_penalty += 250.0
+
+    if train_metrics.open_at_end_rate >= 95.0:
+        open_end_penalty += 250.0
+    if val_metrics.open_at_end_rate >= 90.0:
+        open_end_penalty += 400.0
+
+    if train_metrics.trades > 0 and train_metrics.open_at_end_rate >= 99.9:
+        open_end_penalty += 500.0
+    if val_metrics.trades > 0 and val_metrics.open_at_end_rate >= 99.9:
+        open_end_penalty += 800.0
+
+    return train_score * 0.45 + val_score * 0.55 - shortage_penalty - negative_val_penalty - open_end_penalty
 
 
 def random_genome(cfg: Config) -> StrategyGenome:
@@ -855,13 +871,49 @@ def mutate(genome: StrategyGenome, cfg: Config) -> StrategyGenome:
     return child
 
 
+def clone_genome(genome: StrategyGenome, preserve_id: bool = True) -> StrategyGenome:
+    return StrategyGenome(
+        strategy_id=genome.strategy_id if preserve_id else str(uuid.uuid4())[:8],
+        weights=dict(genome.weights),
+        bias=genome.bias,
+        threshold=genome.threshold,
+        arm_pct=genome.arm_pct,
+        trail_drop_pct=genome.trail_drop_pct,
+        stop_loss_pct=genome.stop_loss_pct,
+    )
+
+
+def score_genome(
+    genome: StrategyGenome,
+    train_samples: List[Sample],
+    val_samples: List[Sample],
+    min_trades: int,
+) -> StrategyMetrics:
+    train_metrics = simulate(genome, train_samples)
+    val_metrics = simulate(genome, val_samples)
+    train_metrics.validation_trades = val_metrics.trades
+    train_metrics.validation_win_rate = val_metrics.win_rate
+    train_metrics.validation_pnl_pct = val_metrics.total_pnl_pct
+    train_metrics.validation_tp_rate = val_metrics.tp_rate
+    train_metrics.validation_stop_rate = val_metrics.stop_rate
+    train_metrics.validation_open_at_end_rate = val_metrics.open_at_end_rate
+    train_metrics.fitness = combine_fitness(train_metrics, val_metrics, min_trades)
+    return train_metrics
+
+
 def tournament_select(scored: List[Tuple[StrategyGenome, StrategyMetrics]], k: int = 4) -> StrategyGenome:
     pool = random.sample(scored, k=min(k, len(scored)))
     pool.sort(key=lambda item: item[1].fitness, reverse=True)
     return pool[0][0]
 
 
-def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureStats], cfg: Config, log: logging.Logger) -> BestStrategyBundle:
+def evolve_strategies(
+    samples: List[Sample],
+    feature_stats: Dict[str, FeatureStats],
+    cfg: Config,
+    log: logging.Logger,
+    incumbent_bundle: Optional[BestStrategyBundle] = None,
+) -> BestStrategyBundle:
     if len(samples) < max(20, cfg.min_trades + 5):
         raise RuntimeError("Not enough history to evolve strategies yet.")
 
@@ -869,23 +921,46 @@ def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureSta
     train_samples = samples[:split_idx]
     val_samples = samples[split_idx:] if split_idx < len(samples) else samples[-max(5, len(samples)//4):]
 
-    population = [random_genome(cfg) for _ in range(cfg.population_size)]
+    population: List[StrategyGenome] = []
+
+    if incumbent_bundle is not None:
+        # Persist the current champion into the next retrain.
+        population.append(clone_genome(incumbent_bundle.genome, preserve_id=True))
+
+        # Seed with prior top genomes so separate cycles build on prior progress.
+        prior_elites = incumbent_bundle.leaderboard or [
+            LeaderboardEntry(rank=1, genome=incumbent_bundle.genome, metrics=incumbent_bundle.metrics)
+        ]
+
+        max_seeded = min(max(cfg.elite_count * 3, 12), max(1, cfg.population_size // 3))
+        for entry in prior_elites[:max_seeded]:
+            population.append(clone_genome(entry.genome, preserve_id=True))
+
+        # Add mutated descendants near the current high score to keep searching around it.
+        seed_sources = [g for g in population[: min(len(population), max(cfg.elite_count, 6))]]
+        max_descendants = min(max(cfg.elite_count * 2, 12), max(1, cfg.population_size // 3))
+        descendants_added = 0
+        for seed in seed_sources:
+            if descendants_added >= max_descendants:
+                break
+            if len(population) >= cfg.population_size:
+                break
+            population.append(mutate(clone_genome(seed, preserve_id=False), cfg))
+            descendants_added += 1
+
+    while len(population) < cfg.population_size:
+        population.append(random_genome(cfg))
+
+    population = population[: cfg.population_size]
+
     top_scored: List[Tuple[StrategyGenome, StrategyMetrics]] = []
     immigrant_count = max(1, int(round(cfg.population_size * cfg.immigrant_fraction))) if cfg.population_size > 2 else 0
 
     for generation in range(1, cfg.generations + 1):
         scored: List[Tuple[StrategyGenome, StrategyMetrics]] = []
         for genome in population:
-            train_metrics = simulate(genome, train_samples)
-            val_metrics = simulate(genome, val_samples)
-            train_metrics.validation_trades = val_metrics.trades
-            train_metrics.validation_win_rate = val_metrics.win_rate
-            train_metrics.validation_pnl_pct = val_metrics.total_pnl_pct
-            train_metrics.validation_tp_rate = val_metrics.tp_rate
-            train_metrics.validation_stop_rate = val_metrics.stop_rate
-            train_metrics.validation_open_at_end_rate = val_metrics.open_at_end_rate
-            train_metrics.fitness = combine_fitness(train_metrics, val_metrics, cfg.min_trades)
-            scored.append((genome, train_metrics))
+            metrics = score_genome(genome, train_samples, val_samples, cfg.min_trades)
+            scored.append((genome, metrics))
 
         scored.sort(key=lambda item: item[1].fitness, reverse=True)
         best_genome, best_metrics = scored[0]
@@ -904,10 +979,10 @@ def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureSta
         )
         top_scored = scored[: max(cfg.leaderboard_size, cfg.elite_count)]
 
-        elites = [g for g, _ in scored[: cfg.elite_count]]
+        elites = [clone_genome(g, preserve_id=True) for g, _ in scored[: cfg.elite_count]]
         next_population: List[StrategyGenome] = list(elites)
-        breed_target = max(cfg.elite_count, cfg.population_size - immigrant_count)
 
+        breed_target = max(cfg.elite_count, cfg.population_size - immigrant_count)
         while len(next_population) < breed_target:
             parent_a = tournament_select(scored)
             parent_b = tournament_select(scored)
@@ -918,7 +993,7 @@ def evolve_strategies(samples: List[Sample], feature_stats: Dict[str, FeatureSta
         while len(next_population) < cfg.population_size:
             next_population.append(random_genome(cfg))
 
-        population = next_population
+        population = next_population[: cfg.population_size]
 
     top_scored.sort(key=lambda item: item[1].fitness, reverse=True)
     best_genome, best_metrics = top_scored[0]
@@ -1130,7 +1205,17 @@ class StrategyService:
             raise RuntimeError("Missing screener headers")
         feature_stats = compute_feature_stats(history_blocks)
         samples = build_samples(history_blocks, feature_stats)
-        bundle = evolve_strategies(samples, feature_stats, self.cfg, self.log)
+
+        with self.lock:
+            incumbent_bundle = self.best_bundle
+
+        bundle = evolve_strategies(
+            samples,
+            feature_stats,
+            self.cfg,
+            self.log,
+            incumbent_bundle=incumbent_bundle,
+        )
         save_bundle(bundle, self.cfg.state_file)
 
         ss = self._sheet()
@@ -1246,6 +1331,7 @@ class StrategyService:
                 "immigrant_fraction": self.cfg.immigrant_fraction,
                 "immigrants_per_generation": max(1, int(round(self.cfg.population_size * self.cfg.immigrant_fraction))) if self.cfg.population_size > 2 else 0,
                 "strategies_tested_per_train": self.cfg.population_size * self.cfg.generations,
+                "seeded_from_incumbent": incumbent_bundle is not None,
             }
 
         return {
@@ -1373,7 +1459,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FX Strategy Generator",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
