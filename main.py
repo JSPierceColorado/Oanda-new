@@ -138,6 +138,30 @@ def mutate_wide_param(current: float, min_value: float, max_value: float, streng
     return clip(current + random.gauss(0.0, step), min_value, max_value)
 
 
+def clamp_exit_params(
+    arm_pct: float,
+    trail_drop_pct: float,
+    stop_loss_pct: float,
+    cfg: "Config",
+) -> Tuple[float, float, float]:
+    # To guarantee trail_drop_pct <= 0.5 * arm_pct while also respecting the
+    # configured trail minimum, arm_pct must be at least 2 * trail_drop_pct_min.
+    arm_floor = max(cfg.arm_pct_min, cfg.trail_drop_pct_min * 2.0)
+
+    if cfg.arm_pct_max < arm_floor:
+        raise ValueError(
+            "Invalid config: ARM_PCT_MAX must be >= max(ARM_PCT_MIN, 2 * TRAIL_DROP_PCT_MIN)"
+        )
+
+    arm = clip(float(arm_pct), arm_floor, cfg.arm_pct_max)
+
+    trail_cap = min(cfg.trail_drop_pct_max, arm * 0.5)
+    trail = clip(float(trail_drop_pct), cfg.trail_drop_pct_min, trail_cap)
+
+    stop = clip(float(stop_loss_pct), cfg.stop_loss_pct_min, cfg.stop_loss_pct_max)
+    return arm, trail, stop
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -205,12 +229,24 @@ class Config:
     def __post_init__(self) -> None:
         if self.elite_count >= self.population_size:
             self.elite_count = max(1, self.population_size // 4)
+
         self.arm_pct_min = max(0.01, self.arm_pct_min)
         self.arm_pct_max = max(self.arm_pct_min, self.arm_pct_max)
+
         self.trail_drop_pct_min = max(0.01, self.trail_drop_pct_min)
         self.trail_drop_pct_max = max(self.trail_drop_pct_min, self.trail_drop_pct_max)
+
         self.stop_loss_pct_min = max(0.01, self.stop_loss_pct_min)
         self.stop_loss_pct_max = max(self.stop_loss_pct_min, self.stop_loss_pct_max)
+
+        # Enforce that every valid arm_pct can support at least the minimum trail_drop_pct
+        self.arm_pct_min = max(self.arm_pct_min, self.trail_drop_pct_min * 2.0)
+
+        if self.arm_pct_max < self.arm_pct_min:
+            raise ValueError(
+                "Invalid config: ARM_PCT_MAX must be >= max(ARM_PCT_MIN, 2 * TRAIL_DROP_PCT_MIN)"
+            )
+
         self.immigrant_fraction = clip(self.immigrant_fraction, 0.0, 0.80)
         self.leaderboard_size = max(10, self.leaderboard_size)
 
@@ -679,14 +715,40 @@ def combine_fitness(train_metrics: StrategyMetrics, val_metrics: StrategyMetrics
 
 
 def random_genome(cfg: Config) -> StrategyGenome:
+    arm_pct = sample_wide_range(
+        cfg.arm_pct_min,
+        cfg.arm_pct_max,
+        max(0.30, cfg.trail_drop_pct_min * 2.0),
+        tail_prob=0.15,
+    )
+
+    trail_cap = min(cfg.trail_drop_pct_max, arm_pct * 0.5)
+    trail_drop_pct = sample_wide_range(
+        cfg.trail_drop_pct_min,
+        trail_cap,
+        min(0.15, trail_cap),
+        tail_prob=0.15,
+    )
+
+    stop_loss_pct = sample_wide_range(
+        cfg.stop_loss_pct_min,
+        cfg.stop_loss_pct_max,
+        0.15,
+        tail_prob=0.15,
+    )
+
+    arm_pct, trail_drop_pct, stop_loss_pct = clamp_exit_params(
+        arm_pct, trail_drop_pct, stop_loss_pct, cfg
+    )
+
     return StrategyGenome(
         strategy_id=str(uuid.uuid4())[:8],
         weights={feature: random.uniform(-2.0, 2.0) for feature in FEATURE_COLUMNS},
         bias=random.uniform(-1.5, 1.5),
         threshold=sample_wide_range(cfg.threshold_min, cfg.threshold_max, 50.0, tail_prob=0.12),
-        arm_pct=sample_wide_range(cfg.arm_pct_min, cfg.arm_pct_max, 0.30, tail_prob=0.15),
-        trail_drop_pct=sample_wide_range(cfg.trail_drop_pct_min, cfg.trail_drop_pct_max, 0.15, tail_prob=0.15),
-        stop_loss_pct=sample_wide_range(cfg.stop_loss_pct_min, cfg.stop_loss_pct_max, 0.15, tail_prob=0.15),
+        arm_pct=arm_pct,
+        trail_drop_pct=trail_drop_pct,
+        stop_loss_pct=stop_loss_pct,
     )
 
 
@@ -700,22 +762,30 @@ def crossover(a: StrategyGenome, b: StrategyGenome, cfg: Config) -> StrategyGeno
         if random.random() < 0.25:
             child_weights[feature] = (a.weights[feature] + b.weights[feature]) / 2.0
 
+    arm_pct = random.choice([a.arm_pct, b.arm_pct, (a.arm_pct + b.arm_pct) / 2.0])
+    trail_drop_pct = random.choice([
+        a.trail_drop_pct,
+        b.trail_drop_pct,
+        (a.trail_drop_pct + b.trail_drop_pct) / 2.0,
+    ])
+    stop_loss_pct = random.choice([
+        a.stop_loss_pct,
+        b.stop_loss_pct,
+        (a.stop_loss_pct + b.stop_loss_pct) / 2.0,
+    ])
+
+    arm_pct, trail_drop_pct, stop_loss_pct = clamp_exit_params(
+        arm_pct, trail_drop_pct, stop_loss_pct, cfg
+    )
+
     return StrategyGenome(
         strategy_id=str(uuid.uuid4())[:8],
         weights=child_weights,
         bias=(a.bias + b.bias) / 2.0 if random.random() < 0.5 else random.choice([a.bias, b.bias]),
         threshold=random.choice([a.threshold, b.threshold, (a.threshold + b.threshold) / 2.0]),
-        arm_pct=random.choice([a.arm_pct, b.arm_pct, (a.arm_pct + b.arm_pct) / 2.0]),
-        trail_drop_pct=random.choice([
-            a.trail_drop_pct,
-            b.trail_drop_pct,
-            (a.trail_drop_pct + b.trail_drop_pct) / 2.0,
-        ]),
-        stop_loss_pct=random.choice([
-            a.stop_loss_pct,
-            b.stop_loss_pct,
-            (a.stop_loss_pct + b.stop_loss_pct) / 2.0,
-        ]),
+        arm_pct=arm_pct,
+        trail_drop_pct=trail_drop_pct,
+        stop_loss_pct=stop_loss_pct,
     )
 
 
@@ -753,16 +823,17 @@ def mutate(genome: StrategyGenome, cfg: Config) -> StrategyGenome:
             cfg.arm_pct_min,
             cfg.arm_pct_max,
             cfg.mutation_strength,
-            0.30,
+            max(0.30, cfg.trail_drop_pct_min * 2.0),
         )
 
     if random.random() < cfg.mutation_rate:
+        trail_cap = min(cfg.trail_drop_pct_max, child.arm_pct * 0.5)
         child.trail_drop_pct = mutate_wide_param(
             child.trail_drop_pct,
             cfg.trail_drop_pct_min,
-            cfg.trail_drop_pct_max,
+            trail_cap,
             cfg.mutation_strength,
-            0.15,
+            min(0.15, trail_cap),
         )
 
     if random.random() < cfg.mutation_rate:
@@ -773,6 +844,13 @@ def mutate(genome: StrategyGenome, cfg: Config) -> StrategyGenome:
             cfg.mutation_strength,
             0.15,
         )
+
+    child.arm_pct, child.trail_drop_pct, child.stop_loss_pct = clamp_exit_params(
+        child.arm_pct,
+        child.trail_drop_pct,
+        child.stop_loss_pct,
+        cfg,
+    )
 
     return child
 
@@ -885,14 +963,22 @@ def save_bundle(bundle: BestStrategyBundle, path: str) -> None:
 def _genome_from_dict(data: Dict[str, Any]) -> StrategyGenome:
     clean = dict(data)
     clean.pop("hold_steps", None)
+
+    arm_pct = float(clean.get("arm_pct", 0.30))
+    trail_drop_pct = float(clean.get("trail_drop_pct", 0.15))
+    stop_loss_pct = float(clean.get("stop_loss_pct", 0.15))
+
+    # Clamp old saved genomes so they cannot keep invalid trail values.
+    trail_drop_pct = min(trail_drop_pct, arm_pct * 0.5)
+
     return StrategyGenome(
         strategy_id=str(clean.get("strategy_id") or str(uuid.uuid4())[:8]),
         weights=dict(clean.get("weights") or {}),
         bias=float(clean.get("bias", 0.0)),
         threshold=float(clean.get("threshold", 50.0)),
-        arm_pct=float(clean.get("arm_pct", 0.30)),
-        trail_drop_pct=float(clean.get("trail_drop_pct", 0.15)),
-        stop_loss_pct=float(clean.get("stop_loss_pct", 0.15)),
+        arm_pct=arm_pct,
+        trail_drop_pct=trail_drop_pct,
+        stop_loss_pct=stop_loss_pct,
     )
 
 
@@ -1287,7 +1373,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FX Strategy Generator",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
