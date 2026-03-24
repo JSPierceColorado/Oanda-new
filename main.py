@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -197,6 +197,8 @@ class Config:
     signals_tab: str = "Signals"
     leaderboard_tab: str = "StrategyLeaderboard"
     best_strategy_tab: str = "BestStrategy"
+    open_trades_tab: str = "OpenTrades"
+    closed_trades_tab: str = "ClosedTrades"
 
     signal_poll_seconds: int = 60
     retrain_minutes: int = 60
@@ -222,6 +224,11 @@ class Config:
     min_trades: int = 15
     validation_split: float = 0.25
     random_seed: int = 42
+
+    min_closed_trades_for_timeout: int = 6
+    min_live_win_rate_pct: float = 50.0
+    strategy_timeout_hours: int = 24
+    timeout_state_file: str = "/tmp/strategy_timeouts.json"
 
     state_file: str = "/tmp/best_strategy.json"
     log_level: str = "INFO"
@@ -249,6 +256,9 @@ class Config:
 
         self.immigrant_fraction = clip(self.immigrant_fraction, 0.0, 0.80)
         self.leaderboard_size = max(10, self.leaderboard_size)
+        self.min_live_win_rate_pct = clip(self.min_live_win_rate_pct, 0.0, 100.0)
+        self.min_closed_trades_for_timeout = max(1, self.min_closed_trades_for_timeout)
+        self.strategy_timeout_hours = max(1, self.strategy_timeout_hours)
 
 
 def load_config() -> Config:
@@ -259,6 +269,8 @@ def load_config() -> Config:
         signals_tab=os.getenv("SIGNALS_TAB", "Signals"),
         leaderboard_tab=os.getenv("LEADERBOARD_TAB", "StrategyLeaderboard"),
         best_strategy_tab=os.getenv("BEST_STRATEGY_TAB", "BestStrategy"),
+        open_trades_tab=os.getenv("OPEN_TRADES_TAB", "OpenTrades"),
+        closed_trades_tab=os.getenv("CLOSED_TRADES_TAB", "ClosedTrades"),
         signal_poll_seconds=env_int("SIGNAL_POLL_SECONDS", 60),
         retrain_minutes=env_int("RETRAIN_MINUTES", 60),
         population_size=env_int("POPULATION_SIZE", 125),
@@ -278,6 +290,11 @@ def load_config() -> Config:
         stop_loss_pct_max=env_float("STOP_LOSS_PCT_MAX", 0.40),
         min_trades=env_int("MIN_TRADES", 15),
         validation_split=env_float("VALIDATION_SPLIT", 0.25),
+        random_seed=env_int("RANDOM_SEED", 42),
+        min_closed_trades_for_timeout=env_int("MIN_CLOSED_TRADES_FOR_TIMEOUT", 6),
+        min_live_win_rate_pct=env_float("MIN_LIVE_WIN_RATE_PCT", 50.0),
+        strategy_timeout_hours=env_int("STRATEGY_TIMEOUT_HOURS", 24),
+        timeout_state_file=os.getenv("TIMEOUT_STATE_FILE", "/tmp/strategy_timeouts.json"),
         state_file=os.getenv("STATE_FILE", "/tmp/best_strategy.json"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )
@@ -416,6 +433,16 @@ class ExitResult:
     bars_held: int
 
 
+@dataclass
+class TradeStats:
+    strategy_id: str
+    open_trades: int = 0
+    closed_trades: int = 0
+    closed_wins: int = 0
+    closed_losses: int = 0
+    closed_win_rate: float = 0.0
+
+
 # ----------------------------
 # Sheet readers
 # ----------------------------
@@ -460,6 +487,142 @@ def read_screener_and_history(gc: gspread.Client, cfg: Config) -> Tuple[List[str
         blocks.append(current_block)
 
     return headers, screener_rows, blocks
+
+
+def read_sheet_rows(ss: gspread.Spreadsheet, title: str) -> List[Dict[str, str]]:
+    try:
+        ws = ss.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return []
+
+    values = ws.get_all_values()
+    if not values:
+        return []
+
+    headers = normalize_row(values[0], len(values[0]))
+    rows: List[Dict[str, str]] = []
+    for row in values[1:]:
+        norm = normalize_row(row, len(headers))
+        if not any(cell.strip() for cell in norm):
+            continue
+        rows.append(dict(zip(headers, norm)))
+    return rows
+
+
+def read_trade_state(gc: gspread.Client, cfg: Config) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    ss = gc.open_by_key(cfg.sheet_id)
+    open_rows = read_sheet_rows(ss, cfg.open_trades_tab)
+    closed_rows = read_sheet_rows(ss, cfg.closed_trades_tab)
+    return open_rows, closed_rows
+
+
+def aggregate_trade_stats(
+    open_rows: List[Dict[str, str]],
+    closed_rows: List[Dict[str, str]],
+) -> Dict[str, TradeStats]:
+    stats: Dict[str, TradeStats] = {}
+
+    def get_stat(strategy_id: str) -> TradeStats:
+        return stats.setdefault(strategy_id, TradeStats(strategy_id=strategy_id))
+
+    for row in open_rows:
+        strategy_id = str(row.get("StrategyID", "")).strip()
+        if not strategy_id:
+            continue
+        get_stat(strategy_id).open_trades += 1
+
+    for row in closed_rows:
+        strategy_id = str(row.get("StrategyID", "")).strip()
+        if not strategy_id:
+            continue
+
+        stat = get_stat(strategy_id)
+        stat.closed_trades += 1
+
+        realized_pl = safe_float(row.get("RealizedPL"), None)
+        price_pct = safe_float(row.get("PricePct"), None)
+
+        is_win = False
+        if realized_pl is not None:
+            is_win = realized_pl > 0
+        elif price_pct is not None:
+            is_win = price_pct > 0
+
+        if is_win:
+            stat.closed_wins += 1
+        else:
+            stat.closed_losses += 1
+
+    for stat in stats.values():
+        if stat.closed_trades > 0:
+            stat.closed_win_rate = stat.closed_wins / stat.closed_trades * 100.0
+
+    return stats
+
+
+def load_timeout_state(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_timeout_state(path: str, payload: Dict[str, Any]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def refresh_timeout_state(
+    current_state: Dict[str, Any],
+    trade_stats: Dict[str, TradeStats],
+    cfg: Config,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    refreshed: Dict[str, Any] = {}
+
+    for strategy_id, info in current_state.items():
+        try:
+            until = datetime.fromisoformat(str(info.get("until", "")).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if until > now:
+            refreshed[strategy_id] = info
+
+    for strategy_id, stat in trade_stats.items():
+        if stat.closed_trades < cfg.min_closed_trades_for_timeout:
+            continue
+        if stat.closed_win_rate >= cfg.min_live_win_rate_pct:
+            continue
+
+        refreshed[strategy_id] = {
+            "until": (now + timedelta(hours=cfg.strategy_timeout_hours)).isoformat(timespec="seconds"),
+            "closed_trades": stat.closed_trades,
+            "closed_win_rate": round(stat.closed_win_rate, 2),
+            "open_trades": stat.open_trades,
+            "triggered_at": now.isoformat(timespec="seconds"),
+        }
+
+    return refreshed
+
+
+def is_strategy_timed_out(
+    strategy_id: str,
+    timeout_state: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> bool:
+    now = now or datetime.now(timezone.utc)
+    info = timeout_state.get(strategy_id)
+    if not info:
+        return False
+    try:
+        until = datetime.fromisoformat(str(info.get("until", "")).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return until > now
 
 
 # ----------------------------
@@ -883,6 +1046,48 @@ def clone_genome(genome: StrategyGenome, preserve_id: bool = True) -> StrategyGe
     )
 
 
+def genome_signature(genome: StrategyGenome, decimals: int = 6) -> str:
+    payload = {
+        "bias": round(genome.bias, decimals),
+        "threshold": round(genome.threshold, decimals),
+        "arm_pct": round(genome.arm_pct, decimals),
+        "trail_drop_pct": round(genome.trail_drop_pct, decimals),
+        "stop_loss_pct": round(genome.stop_loss_pct, decimals),
+        "weights": {
+            feature: round(genome.weights.get(feature, 0.0), decimals)
+            for feature in FEATURE_COLUMNS
+        },
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def dedupe_population(population: List[StrategyGenome]) -> List[StrategyGenome]:
+    seen: set[str] = set()
+    unique: List[StrategyGenome] = []
+    for genome in population:
+        sig = genome_signature(genome)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(genome)
+    return unique
+
+
+def dedupe_scored(
+    scored: List[Tuple[StrategyGenome, StrategyMetrics]]
+) -> List[Tuple[StrategyGenome, StrategyMetrics]]:
+    best_by_sig: Dict[str, Tuple[StrategyGenome, StrategyMetrics]] = {}
+    for genome, metrics in scored:
+        sig = genome_signature(genome)
+        current = best_by_sig.get(sig)
+        if current is None or metrics.fitness > current[1].fitness:
+            best_by_sig[sig] = (genome, metrics)
+
+    unique = list(best_by_sig.values())
+    unique.sort(key=lambda item: item[1].fitness, reverse=True)
+    return unique
+
+
 def score_genome(
     genome: StrategyGenome,
     train_samples: List[Sample],
@@ -913,7 +1118,10 @@ def evolve_strategies(
     cfg: Config,
     log: logging.Logger,
     incumbent_bundle: Optional[BestStrategyBundle] = None,
+    timed_out_strategy_ids: Optional[set[str]] = None,
 ) -> BestStrategyBundle:
+    timed_out_strategy_ids = timed_out_strategy_ids or set()
+
     if len(samples) < max(20, cfg.min_trades + 5):
         raise RuntimeError("Not enough history to evolve strategies yet.")
 
@@ -923,7 +1131,7 @@ def evolve_strategies(
 
     population: List[StrategyGenome] = []
 
-    if incumbent_bundle is not None:
+    if incumbent_bundle is not None and incumbent_bundle.genome.strategy_id not in timed_out_strategy_ids:
         # Persist the current champion into the next retrain.
         population.append(clone_genome(incumbent_bundle.genome, preserve_id=True))
 
@@ -934,7 +1142,9 @@ def evolve_strategies(
 
         max_seeded = min(max(cfg.elite_count * 3, 12), max(1, cfg.population_size // 3))
         for entry in prior_elites[:max_seeded]:
-            population.append(clone_genome(entry.genome, preserve_id=True))
+            if entry.genome.strategy_id in timed_out_strategy_ids:
+                continue
+            population.append(clone_genome(entry.genome, preserve_id=False))
 
         # Add mutated descendants near the current high score to keep searching around it.
         seed_sources = [g for g in population[: min(len(population), max(cfg.elite_count, 6))]]
@@ -948,8 +1158,16 @@ def evolve_strategies(
             population.append(mutate(clone_genome(seed, preserve_id=False), cfg))
             descendants_added += 1
 
+    population = dedupe_population(population)
+    population_signatures = {genome_signature(genome) for genome in population}
+
     while len(population) < cfg.population_size:
-        population.append(random_genome(cfg))
+        candidate = random_genome(cfg)
+        sig = genome_signature(candidate)
+        if sig in population_signatures:
+            continue
+        population.append(candidate)
+        population_signatures.add(sig)
 
     population = population[: cfg.population_size]
 
@@ -959,13 +1177,18 @@ def evolve_strategies(
     for generation in range(1, cfg.generations + 1):
         scored: List[Tuple[StrategyGenome, StrategyMetrics]] = []
         for genome in population:
+            if genome.strategy_id in timed_out_strategy_ids:
+                continue
             metrics = score_genome(genome, train_samples, val_samples, cfg.min_trades)
             scored.append((genome, metrics))
 
-        scored.sort(key=lambda item: item[1].fitness, reverse=True)
+        scored = dedupe_scored(scored)
+        if not scored:
+            raise RuntimeError("All candidate strategies were filtered out.")
+
         best_genome, best_metrics = scored[0]
         log.info(
-            "generation=%d best_fitness=%.2f trades=%d win_rate=%.1f total_pnl=%.3f threshold=%.1f arm=%.3f trail=%.3f stop=%.3f open_end_rate=%.1f",
+            "generation=%d best_fitness=%.2f trades=%d win_rate=%.1f total_pnl=%.3f threshold=%.1f arm=%.3f trail=%.3f stop=%.3f open_end_rate=%.1f unique_candidates=%d",
             generation,
             best_metrics.fitness,
             best_metrics.trades,
@@ -976,26 +1199,36 @@ def evolve_strategies(
             best_genome.trail_drop_pct,
             best_genome.stop_loss_pct,
             best_metrics.open_at_end_rate,
+            len(scored),
         )
         top_scored = scored[: max(cfg.leaderboard_size, cfg.elite_count)]
 
-        elites = [clone_genome(g, preserve_id=True) for g, _ in scored[: cfg.elite_count]]
-        next_population: List[StrategyGenome] = list(elites)
+        elites = [clone_genome(g, preserve_id=False) for g, _ in scored[: cfg.elite_count]]
+        next_population: List[StrategyGenome] = dedupe_population(elites)
+        next_population_signatures = {genome_signature(genome) for genome in next_population}
 
         breed_target = max(cfg.elite_count, cfg.population_size - immigrant_count)
         while len(next_population) < breed_target:
             parent_a = tournament_select(scored)
             parent_b = tournament_select(scored)
-            child = crossover(parent_a, parent_b, cfg)
-            child = mutate(child, cfg)
+            child = mutate(crossover(parent_a, parent_b, cfg), cfg)
+            sig = genome_signature(child)
+            if sig in next_population_signatures:
+                continue
             next_population.append(child)
+            next_population_signatures.add(sig)
 
         while len(next_population) < cfg.population_size:
-            next_population.append(random_genome(cfg))
+            candidate = random_genome(cfg)
+            sig = genome_signature(candidate)
+            if sig in next_population_signatures:
+                continue
+            next_population.append(candidate)
+            next_population_signatures.add(sig)
 
         population = next_population[: cfg.population_size]
 
-    top_scored.sort(key=lambda item: item[1].fitness, reverse=True)
+    top_scored = dedupe_scored(top_scored)
     best_genome, best_metrics = top_scored[0]
 
     leaderboard: List[LeaderboardEntry] = []
@@ -1010,7 +1243,6 @@ def evolve_strategies(
         leaderboard=leaderboard,
     )
     return bundle
-
 
 # ----------------------------
 # Persistence
@@ -1150,6 +1382,47 @@ def build_signal_rows(bundle: BestStrategyBundle, screener_rows: List[Dict[str, 
     return rows
 
 
+def build_flat_signal_rows(
+    screener_rows: List[Dict[str, str]],
+    strategy_id: str = "TIMEOUT",
+    trained_at: str = "",
+) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    for row in screener_rows:
+        symbol = str(row.get("symbol", "")).strip()
+        if not symbol:
+            continue
+
+        rows.append([
+            row.get("asof_utc", utc_now_iso()),
+            symbol,
+            0.0,
+            "FLAT",
+            "FALSE",
+            "",
+            "",
+            "",
+            "",
+            row.get("last_trade_price", ""),
+            row.get("bid", ""),
+            row.get("ask", ""),
+            row.get("spread_bps", ""),
+            row.get("atr_pct", ""),
+            row.get("pos_20d", ""),
+            row.get("pos_52w", ""),
+            row.get("trend_200", ""),
+            row.get("chg_1d_pct", ""),
+            row.get("chg_5d_pct", ""),
+            row.get("dist_sma50_pct", ""),
+            row.get("dist_sma200_pct", ""),
+            "timed_out",
+            strategy_id,
+            trained_at,
+        ])
+
+    return rows
+
+
 SIGNAL_HEADERS = [
     "asof_utc",
     "symbol",
@@ -1205,6 +1478,18 @@ class StrategyService:
             raise RuntimeError("Missing screener headers")
         feature_stats = compute_feature_stats(history_blocks)
         samples = build_samples(history_blocks, feature_stats)
+        open_trade_rows, closed_trade_rows = read_trade_state(self.gc, self.cfg)
+        trade_stats = aggregate_trade_stats(open_trade_rows, closed_trade_rows)
+
+        timeout_state = load_timeout_state(self.cfg.timeout_state_file)
+        timeout_state = refresh_timeout_state(timeout_state, trade_stats, self.cfg)
+        save_timeout_state(self.cfg.timeout_state_file, timeout_state)
+
+        timed_out_strategy_ids = {
+            strategy_id
+            for strategy_id in timeout_state.keys()
+            if is_strategy_timed_out(strategy_id, timeout_state)
+        }
 
         with self.lock:
             incumbent_bundle = self.best_bundle
@@ -1215,6 +1500,7 @@ class StrategyService:
             self.cfg,
             self.log,
             incumbent_bundle=incumbent_bundle,
+            timed_out_strategy_ids=timed_out_strategy_ids,
         )
         save_bundle(bundle, self.cfg.state_file)
 
@@ -1244,16 +1530,23 @@ class StrategyService:
             "validation_tp_rate",
             "validation_stop_rate",
             "validation_open_at_end_rate",
+            "live_open_trades",
+            "live_closed_trades",
+            "live_closed_win_rate",
+            "timed_out_until",
             "threshold",
             "arm_pct",
             "trail_drop_pct",
             "stop_loss_pct",
             "trained_at",
             "weights_json",
+            "signature",
         ]
 
         rows = []
         for entry in bundle.leaderboard or [LeaderboardEntry(rank=1, genome=bundle.genome, metrics=bundle.metrics)]:
+            live = trade_stats.get(entry.genome.strategy_id, TradeStats(strategy_id=entry.genome.strategy_id))
+            timeout_info = timeout_state.get(entry.genome.strategy_id, {})
             rows.append([
                 entry.rank,
                 entry.genome.strategy_id,
@@ -1276,15 +1569,22 @@ class StrategyService:
                 round(entry.metrics.validation_tp_rate, 2),
                 round(entry.metrics.validation_stop_rate, 2),
                 round(entry.metrics.validation_open_at_end_rate, 2),
+                live.open_trades,
+                live.closed_trades,
+                round(live.closed_win_rate, 2),
+                timeout_info.get("until", ""),
                 round(entry.genome.threshold, 2),
                 round(entry.genome.arm_pct, 4),
                 round(entry.genome.trail_drop_pct, 4),
                 round(entry.genome.stop_loss_pct, 4),
                 bundle.trained_at,
                 json.dumps(entry.genome.weights, separators=(",", ":")),
+                genome_signature(entry.genome),
             ])
         write_table(leaderboard_ws, leaderboard_headers, rows)
 
+        best_live = trade_stats.get(bundle.genome.strategy_id, TradeStats(strategy_id=bundle.genome.strategy_id))
+        best_timeout_info = timeout_state.get(bundle.genome.strategy_id, {})
         write_key_values(best_ws, [
             ("strategy_id", bundle.genome.strategy_id),
             ("trained_at", bundle.trained_at),
@@ -1307,10 +1607,15 @@ class StrategyService:
             ("validation_tp_rate", round(bundle.metrics.validation_tp_rate, 2)),
             ("validation_stop_rate", round(bundle.metrics.validation_stop_rate, 2)),
             ("validation_open_at_end_rate", round(bundle.metrics.validation_open_at_end_rate, 2)),
+            ("live_open_trades", best_live.open_trades),
+            ("live_closed_trades", best_live.closed_trades),
+            ("live_closed_win_rate", round(best_live.closed_win_rate, 2)),
+            ("timed_out_until", best_timeout_info.get("until", "")),
             ("threshold", round(bundle.genome.threshold, 2)),
             ("arm_pct", round(bundle.genome.arm_pct, 4)),
             ("trail_drop_pct", round(bundle.genome.trail_drop_pct, 4)),
             ("stop_loss_pct", round(bundle.genome.stop_loss_pct, 4)),
+            ("signature", genome_signature(bundle.genome)),
             ("weights", bundle.genome.weights),
         ])
 
@@ -1321,6 +1626,9 @@ class StrategyService:
                 "samples": len(samples),
                 "history_blocks": len(history_blocks),
                 "screener_rows": len(screener_rows),
+                "open_trade_rows": len(open_trade_rows),
+                "closed_trade_rows": len(closed_trade_rows),
+                "timed_out_strategies": len(timed_out_strategy_ids),
                 "strategy_id": bundle.genome.strategy_id,
                 "fitness": bundle.metrics.fitness,
                 "threshold": bundle.genome.threshold,
@@ -1345,6 +1653,8 @@ class StrategyService:
             "stop_rate": bundle.metrics.stop_rate,
             "open_at_end_rate": bundle.metrics.open_at_end_rate,
             "total_pnl_pct": bundle.metrics.total_pnl_pct,
+            "live_closed_trades": best_live.closed_trades,
+            "live_closed_win_rate": best_live.closed_win_rate,
         }
 
     def score_once(self) -> Dict[str, Any]:
@@ -1356,7 +1666,52 @@ class StrategyService:
         headers, screener_rows, history_blocks = read_screener_and_history(self.gc, self.cfg)
         _ = headers, history_blocks
 
-        rows = build_signal_rows(bundle, screener_rows)
+        timeout_state = load_timeout_state(self.cfg.timeout_state_file)
+
+        active_genome = bundle.genome
+        active_metrics = bundle.metrics
+
+        if is_strategy_timed_out(active_genome.strategy_id, timeout_state):
+            fallback: Optional[LeaderboardEntry] = None
+            for entry in bundle.leaderboard:
+                if not is_strategy_timed_out(entry.genome.strategy_id, timeout_state):
+                    fallback = entry
+                    break
+
+            if fallback is not None:
+                active_genome = fallback.genome
+                active_metrics = fallback.metrics
+            else:
+                rows = build_flat_signal_rows(
+                    screener_rows,
+                    strategy_id=active_genome.strategy_id,
+                    trained_at=bundle.trained_at,
+                )
+                ss = self._sheet()
+                signals_ws = get_or_create_ws(ss, self.cfg.signals_tab, rows=max(500, len(rows) + 5), cols=len(SIGNAL_HEADERS) + 5)
+                write_table(signals_ws, SIGNAL_HEADERS, rows)
+
+                with self.lock:
+                    self.last_signal_at = utc_now_iso()
+
+                return {
+                    "ok": True,
+                    "signals_written": len(rows),
+                    "last_signal_at": self.last_signal_at,
+                    "strategy_id": active_genome.strategy_id,
+                    "timed_out": True,
+                    "fallback_strategy_id": None,
+                }
+
+        active_bundle = BestStrategyBundle(
+            genome=active_genome,
+            metrics=active_metrics,
+            feature_stats=bundle.feature_stats,
+            trained_at=bundle.trained_at,
+            leaderboard=bundle.leaderboard,
+        )
+
+        rows = build_signal_rows(active_bundle, screener_rows)
         ss = self._sheet()
         signals_ws = get_or_create_ws(ss, self.cfg.signals_tab, rows=max(500, len(rows) + 5), cols=len(SIGNAL_HEADERS) + 5)
         write_table(signals_ws, SIGNAL_HEADERS, rows)
@@ -1368,10 +1723,12 @@ class StrategyService:
             "ok": True,
             "signals_written": len(rows),
             "last_signal_at": self.last_signal_at,
-            "strategy_id": bundle.genome.strategy_id,
-            "arm_pct": bundle.genome.arm_pct,
-            "trail_drop_pct": bundle.genome.trail_drop_pct,
-            "stop_loss_pct": bundle.genome.stop_loss_pct,
+            "strategy_id": active_genome.strategy_id,
+            "arm_pct": active_genome.arm_pct,
+            "trail_drop_pct": active_genome.trail_drop_pct,
+            "stop_loss_pct": active_genome.stop_loss_pct,
+            "timed_out": active_genome.strategy_id != bundle.genome.strategy_id,
+            "fallback_strategy_id": active_genome.strategy_id if active_genome.strategy_id != bundle.genome.strategy_id else None,
         }
 
     def cycle_once(self) -> Dict[str, Any]:
@@ -1420,6 +1777,12 @@ class StrategyService:
             self.thread.join(timeout=10)
 
     def status(self) -> Dict[str, Any]:
+        timeout_state = load_timeout_state(self.cfg.timeout_state_file)
+        active_timeouts = {
+            strategy_id: info
+            for strategy_id, info in timeout_state.items()
+            if is_strategy_timed_out(strategy_id, timeout_state)
+        }
         with self.lock:
             bundle = self.best_bundle
             return {
@@ -1430,6 +1793,7 @@ class StrategyService:
                 "best_strategy": asdict(bundle.genome) if bundle else None,
                 "best_metrics": asdict(bundle.metrics) if bundle else None,
                 "summary": self.last_generation_summary,
+                "active_timeouts": active_timeouts,
             }
 
 
