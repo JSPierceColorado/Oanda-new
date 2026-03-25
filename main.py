@@ -221,7 +221,8 @@ class Config:
     stop_loss_pct_min: float = 0.05
     stop_loss_pct_max: float = 0.40
 
-    min_trades: int = 15
+    # Allow early evolution on tiny startup histories; can still be overridden with MIN_TRADES.
+    min_trades: int = 1
     validation_split: float = 0.25
     random_seed: int = 42
 
@@ -288,7 +289,7 @@ def load_config() -> Config:
         trail_drop_pct_max=env_float("TRAIL_DROP_PCT_MAX", 0.40),
         stop_loss_pct_min=env_float("STOP_LOSS_PCT_MIN", 0.05),
         stop_loss_pct_max=env_float("STOP_LOSS_PCT_MAX", 0.40),
-        min_trades=env_int("MIN_TRADES", 15),
+        min_trades=env_int("MIN_TRADES", 1),
         validation_split=env_float("VALIDATION_SPLIT", 0.25),
         random_seed=env_int("RANDOM_SEED", 42),
         min_closed_trades_for_timeout=env_int("MIN_CLOSED_TRADES_FOR_TIMEOUT", 6),
@@ -686,7 +687,8 @@ def build_samples(blocks: List[List[Dict[str, str]]], feature_stats: Dict[str, F
 
     samples: List[Sample] = []
     for symbol, rows in series.items():
-        if len(rows) <= 2:
+        # Two snapshots for a symbol are enough to make one sample: current row + one future price.
+        if len(rows) <= 1:
             continue
         for i in range(len(rows) - 1):
             current = rows[i]
@@ -1122,7 +1124,9 @@ def evolve_strategies(
 ) -> BestStrategyBundle:
     timed_out_strategy_ids = timed_out_strategy_ids or set()
 
-    if len(samples) < max(20, cfg.min_trades + 5):
+    # Begin evolving as soon as we have at least one valid sample. The full history tab is still used;
+    # this only relaxes the startup gate so evolution can begin with very small histories.
+    if len(samples) < 1:
         raise RuntimeError("Not enough history to evolve strategies yet.")
 
     split_idx = max(1, int(len(samples) * (1.0 - cfg.validation_split)))
